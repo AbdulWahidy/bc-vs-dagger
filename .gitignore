@@ -1,0 +1,8 @@
+experts/*.zip
+experts/*.npz
+data/*.npz
+results/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/

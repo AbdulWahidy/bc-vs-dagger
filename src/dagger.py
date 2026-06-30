@@ -1,77 +1,89 @@
-"""DAgger (Dataset Aggregation) training loop.
+"""DAgger: Dataset Aggregation.
 
-DAgger fixes BC's compounding-error problem by iteratively expanding the
-training dataset with states the *learner* actually visits, labelled by the
-expert.  After each rollout the buffer grows and the policy is retrained from
-scratch on the full aggregate — so the policy eventually covers the states it
-will encounter at test time.
+Reuses everything — MLPPolicy, train_bc, Expert.predict, DemoDataset.add. The
+only new idea is WHO drives during data collection:
 
-Reference: Ross, Gordon & Bagnell (2011) — "A Reduction of Imitation Learning
-and Structured Prediction to No-Regret Online Learning."
+  repeat:
+    1. train policy on the current aggregated dataset        [train_bc]
+    2. roll the *student* out; record the states it visits   [student drives]
+    3. ask the expert for the right action at each state      [Expert.predict]
+    4. add (student_state, expert_action) to the dataset      [DemoDataset.add]
+
+We track cumulative expert-label count so step 06 can compare label-efficiency
+against BC on the same axes.
 """
-
+from __future__ import annotations
 import numpy as np
+import gymnasium as gym
 
-from data import DaggerBuffer, rollout_learner
-from bc import train_bc
-from policy import MLPPolicy
+from src.bc import train_bc
+from src.data import DemoDataset
 
 
-def train_dagger(
-    expert,
-    env_id: str,
-    obs_dim: int,
-    act_dim: int,
-    n_iterations: int = 10,
-    rollout_episodes: int = 10,
-    n_epochs: int = 20,
-    batch_size: int = 64,
-    lr: float = 1e-3,
-) -> MLPPolicy:
-    """Run the DAgger outer loop and return the final imitation policy.
+def collect_student_states(policy, env_id, n_episodes, seed):
+    """Roll the CURRENT student out; record every observation it visits.
+    We keep the student's STATES and discard the student's actions — those are
+    the mistakes. The expert supplies the correct actions afterward."""
+    env = gym.make(env_id)
+    states, returns = [], []
+    for ep in range(n_episodes):
+        obs, _ = env.reset(seed=seed + ep)
+        done, total = False, 0.0
+        while not done:
+            states.append(np.asarray(obs, dtype=np.float32))
+            action = policy.predict(obs, deterministic=True)  # student drives
+            obs, reward, terminated, truncated, _ = env.step(action)
+            total += reward
+            done = terminated or truncated
+        returns.append(total)
+    env.close()
+    return np.array(states, dtype=np.float32), returns
 
-    Each iteration:
-      1. Roll out the *current* learner to collect visited observations.
-      2. Query the *expert* on every visited observation to get labels.
-      3. Add the (obs, expert_action) pairs to the aggregation buffer.
-      4. Retrain the policy from scratch on the full buffer via BC.
 
-    Args:
-        expert: Callable ``obs -> action`` — the oracle that provides labels.
-            Typically a lambda wrapping ``query_expert``.
-        env_id: Gymnasium environment ID used for learner rollouts.
-        obs_dim: Observation vector length — passed to the policy constructor.
-        act_dim: Action vector length — passed to the policy constructor.
-        n_iterations: Number of DAgger iterations (dataset grows each round).
-        rollout_episodes: Episodes rolled out *per iteration* by the learner.
-        n_epochs: BC training epochs run after each aggregation step.
-        batch_size: Mini-batch size for BC inner loop.
-        lr: Adam learning rate for BC inner loop.
+def evaluate_policy(policy, env_id, n_episodes, seed):
+    env = gym.make(env_id)
+    returns = []
+    for ep in range(n_episodes):
+        obs, _ = env.reset(seed=seed + ep)
+        done, total = False, 0.0
+        while not done:
+            action = policy.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            total += reward
+            done = terminated or truncated
+        returns.append(total)
+    env.close()
+    return np.array(returns)
 
-    Returns:
-        The final ``MLPPolicy`` trained on the fully aggregated dataset.
+
+def run_dagger(seed_dataset, expert, obs_dim, act_dim, *, env_id="Hopper-v5",
+               n_iterations=8, rollout_episodes=1, epochs=100, train_seed=0,
+               eval_episodes=20, eval_seed=3000, collect_seed=5000, verbose=True):
+    """Run DAgger from a seed dataset. Returns (final_policy, records).
+
+    Each iteration: retrain from scratch on the aggregated data (matches how BC
+    ablation trained — apples to apples), evaluate, then collect+label+aggregate.
+    records: per-iteration dicts with cumulative n_labels, return mean/std.
     """
-    buffer = DaggerBuffer()
-    # Start with a randomly initialised policy; it improves each iteration.
-    policy = MLPPolicy(obs_dim, act_dim)
+    dataset = DemoDataset(seed_dataset.obs.copy(), seed_dataset.act.copy())
+    records = []
 
-    for iteration in range(n_iterations):
-        print(f"\n--- DAgger iteration {iteration + 1}/{n_iterations} ---")
+    for it in range(n_iterations + 1):
+        policy, _ = train_bc(dataset, obs_dim, act_dim,
+                             epochs=epochs, seed=train_seed, verbose=False)
+        r = evaluate_policy(policy, env_id, eval_episodes, eval_seed)
+        rec = dict(iter=it, n_labels=len(dataset),
+                   return_mean=float(r.mean()), return_std=float(r.std()))
+        if verbose:
+            print(f"  DAgger iter {it:2d}  labels={len(dataset):6d}  "
+                  f"return={r.mean():7.1f} ± {r.std():5.1f}")
 
-        # Step 1: collect states the current learner visits.
-        episode_obs_list = rollout_learner(policy, env_id, n_episodes=rollout_episodes)
+        if it < n_iterations:
+            states, roll_rets = collect_student_states(
+                policy, env_id, rollout_episodes, collect_seed + it * 100)
+            expert_actions = expert.predict(states, deterministic=True)
+            dataset.add(states, expert_actions)
+            rec["new_labels"] = int(len(states))
+        records.append(rec)
 
-        # Step 2: relabel every visited state with the expert's action.
-        iter_obs = np.concatenate(episode_obs_list, axis=0)
-        iter_acts = np.array([expert(o) for o in iter_obs])
-
-        # Step 3: aggregate into the growing buffer.
-        buffer.add(iter_obs, iter_acts)
-        print(f"Buffer size: {len(buffer)} transitions")
-
-        # Step 4: retrain from scratch on the full aggregate.
-        agg = buffer.to_arrays()
-        policy = train_bc(agg, obs_dim, act_dim, n_epochs=n_epochs,
-                          batch_size=batch_size, lr=lr)
-
-    return policy
+    return policy, records

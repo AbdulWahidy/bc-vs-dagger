@@ -1,50 +1,58 @@
-"""Train a DAgger policy."""
+"""Step 05: DAgger from a starved 1-demo seed.
 
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+BC at 1 demo was stuck at ~1015 ± 684 (collapsed AND unstable). Seed DAgger
+with that SAME 1 demo; let it collect expert corrections on the student's own
+drifted states. Watch return climb to expert level while we count cumulative
+expert labels — the basis for the label-efficiency comparison in step 06.
+"""
+import argparse, os, sys
+import numpy as np
 
-import gymnasium as gym
-import torch
-from experts import load_expert, query_expert
-from dagger import train_dagger
-from evaluate import evaluate_policy
-from utils import seed_everything, log_to_csv
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from src.experts import Expert, _paths
+from src.data import load_demonstrations, DemoDataset
+from src.dagger import run_dagger
 
-ENV_ID = "LunarLander-v2"
-EXPERT_PATH = "experts/ppo_lunarlander"
-RESULTS_CSV = "results/dagger_results.csv"
-N_ITERATIONS = 10
-ROLLOUT_EPISODES = 10
-N_EPOCHS = 20
-SEED = 42
 
-if __name__ == "__main__":
-    seed_everything(SEED)
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--env-id", default="Hopper-v5")
+    p.add_argument("--demos", default="data/demos.npz")
+    p.add_argument("--expert-dir", default="experts")
+    p.add_argument("--seed-demos", type=int, default=1)
+    p.add_argument("--iterations", type=int, default=8)
+    p.add_argument("--rollout-episodes", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--train-seed", type=int, default=0)
+    p.add_argument("--out", default="results/dagger.npz")
+    args = p.parse_args()
 
-    env = gym.make(ENV_ID)
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0] if hasattr(env.action_space, "shape") else env.action_space.n
-    env.close()
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    trajs = load_demonstrations(args.demos)
+    seed_dataset = DemoDataset.from_trajectories(trajs, n_demos=args.seed_demos)
+    obs_dim, act_dim = seed_dataset.obs.shape[1], seed_dataset.act.shape[1]
 
-    model = load_expert(EXPERT_PATH, ENV_ID)
-    expert_fn = lambda obs: query_expert(model, obs)
+    model_path, stats_path = _paths(args.env_id, args.expert_dir)
+    expert = Expert.load(model_path, stats_path)
 
-    print(f"Training DAgger for {N_ITERATIONS} iterations...")
-    policy = train_dagger(
-        expert_fn,
-        ENV_ID,
-        obs_dim=obs_dim,
-        act_dim=act_dim,
-        n_iterations=N_ITERATIONS,
-        rollout_episodes=ROLLOUT_EPISODES,
-        n_epochs=N_EPOCHS,
+    print(f"Seeding DAgger with {args.seed_demos} demo(s) "
+          f"({len(seed_dataset)} pairs). Running {args.iterations} iterations.\n")
+    policy, records = run_dagger(
+        seed_dataset, expert, obs_dim, act_dim,
+        env_id=args.env_id, n_iterations=args.iterations,
+        rollout_episodes=args.rollout_episodes, epochs=args.epochs,
+        train_seed=args.train_seed,
     )
 
-    mean, std = evaluate_policy(policy, ENV_ID, n_episodes=20, seed=SEED)
-    print(f"DAgger return: {mean:.1f} ± {std:.1f}")
+    labels = np.array([r["n_labels"] for r in records])
+    means = np.array([r["return_mean"] for r in records])
+    stds = np.array([r["return_std"] for r in records])
+    np.savez(args.out, labels=labels, means=means, stds=stds)
+    print(f"\nSaved DAgger curve -> {args.out}")
+    print(f"Start: {means[0]:.1f} ± {stds[0]:.1f} at {labels[0]} labels")
+    print(f"End:   {means[-1]:.1f} ± {stds[-1]:.1f} at {labels[-1]} labels")
+    print("Step 06 plots this against the BC ablation.")
 
-    os.makedirs("results", exist_ok=True)
-    log_to_csv(RESULTS_CSV, {"method": "DAgger", "n_iterations": N_ITERATIONS,
-                              "mean_return": mean, "std_return": std})
-    torch.save(policy.state_dict(), "results/dagger_policy.pt")
+
+if __name__ == "__main__":
+    main()

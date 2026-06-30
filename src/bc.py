@@ -1,66 +1,51 @@
-"""Behavior Cloning (BC) training loop.
+"""Behavior cloning: plain supervised regression from obs to expert action.
 
-BC treats imitation learning as supervised regression: given a fixed dataset of
-(observation, action) pairs collected from an expert, it minimises MSE between
-the policy's predicted actions and the expert's recorded actions.
-
-Limitation: BC is vulnerable to compounding errors — small deviations from the
-training distribution accumulate over a trajectory, pushing the agent into
-states the expert never visited.  The ``04_bc_data_ablation`` script
-demonstrates this collapse as the number of demos decreases.
+There is nothing imitation-specific in the training math here — it's MSE
+regression. The *only* thing that makes it "imitation learning" is where the
+data came from (expert rollouts) and where it gets tested (the env). That's the
+whole subtlety BC ignores and DAgger addresses.
 """
-
+from __future__ import annotations
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 
-from policy import MLPPolicy
+from src.policy import MLPPolicy
+from src.data import DemoDataset
 
 
-def train_bc(
-    demos: dict,
-    obs_dim: int,
-    act_dim: int,
-    n_epochs: int = 50,
-    batch_size: int = 64,
-    lr: float = 1e-3,
-) -> MLPPolicy:
-    """Train an MLP policy via supervised imitation on a fixed demo dataset.
+def train_bc(dataset: DemoDataset, obs_dim, act_dim, *,
+             epochs=100, batch_size=256, lr=1e-3, hidden=(256, 256),
+             device="cpu", seed=0, verbose=True):
+    """Fit an MLPPolicy to (obs -> action) by MSE. Returns the trained policy.
 
-    Args:
-        demos: Dict with ``"observations"`` ``(N, obs_dim)`` and ``"actions"``
-            ``(N, act_dim)`` NumPy arrays, as returned by ``collect_demos`` or
-            ``DaggerBuffer.to_arrays()``.
-        obs_dim: Observation vector length — used to construct the network.
-        act_dim: Action vector length — used to construct the network.
-        n_epochs: Number of full passes over the dataset.
-        batch_size: Mini-batch size for gradient updates.
-        lr: Adam learning rate.
-
-    Returns:
-        The trained ``MLPPolicy`` (in eval-mode-compatible state; gradients
-        still enabled — call ``policy.eval()`` before deployment if needed).
+    'epochs' here = passes' worth of gradient steps: we do
+    len(dataset)/batch_size steps per epoch, sampling random minibatches.
     """
-    obs = torch.FloatTensor(demos["observations"])
-    acts = torch.FloatTensor(demos["actions"])
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    dataset = TensorDataset(obs, acts)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    policy = MLPPolicy(obs_dim, act_dim)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+    policy = MLPPolicy(obs_dim, act_dim, hidden=hidden).to(device)
+    opt = torch.optim.Adam(policy.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
 
-    for epoch in range(n_epochs):
-        total_loss = 0.0
-        for batch_obs, batch_acts in loader:
-            pred = policy(batch_obs)
-            loss = loss_fn(pred, batch_acts)
-            optimizer.zero_grad()
+    n = len(dataset)
+    steps_per_epoch = max(1, n // batch_size)
+    history = []
+    for ep in range(epochs):
+        ep_loss = 0.0
+        for _ in range(steps_per_epoch):
+            obs_b, act_b = dataset.sample(batch_size)
+            obs_t = torch.as_tensor(obs_b, dtype=torch.float32, device=device)
+            act_t = torch.as_tensor(act_b, dtype=torch.float32, device=device)
+            pred = policy(obs_t)
+            loss = loss_fn(pred, act_t)
+            opt.zero_grad()
             loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch + 1}/{n_epochs}  loss={total_loss / len(loader):.4f}")
-
-    return policy
+            opt.step()
+            ep_loss += loss.item()
+        ep_loss /= steps_per_epoch
+        history.append(ep_loss)
+        if verbose and (ep % 10 == 0 or ep == epochs - 1):
+            print(f"  epoch {ep:3d}  mse={ep_loss:.5f}")
+    return policy, history

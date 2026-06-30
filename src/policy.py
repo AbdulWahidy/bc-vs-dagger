@@ -1,72 +1,38 @@
-"""Shared MLP policy architecture used by both BC and DAgger.
+"""The imitation policy: a small MLP mapping observation -> action.
 
-Keeping a single ``MLPPolicy`` class here ensures BC and DAgger are always
-compared on identical network capacity.  The class is a thin ``nn.Module``
-wrapper that adds a NumPy-friendly ``predict`` method so it can be used as a
-drop-in callable wherever ``obs -> action`` is expected.
+Deliberately minimal. The point of the project is to study *data distribution*
+(BC vs DAgger), so we hold the model fixed and simple — same network for both
+methods. If BC fails and DAgger succeeds with this identical net, the
+difference is provably about the data, not the architecture.
+
+Hopper: obs_dim=11, act_dim=3, actions in [-1, 1]. We tanh the output to
+respect the action bounds.
 """
-
+from __future__ import annotations
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 
 
 class MLPPolicy(nn.Module):
-    """Fully-connected policy network mapping observations to actions.
-
-    Architecture: Linear → ReLU stacked ``len(hidden_sizes)`` times, followed
-    by a linear output layer.  No activation on the output, so it can represent
-    both continuous actions (regression) and raw logits (if wrapped with a loss
-    that applies softmax).
-
-    Args:
-        obs_dim: Dimensionality of the observation vector.
-        act_dim: Dimensionality of the action output.
-        hidden_sizes: Width of each hidden layer. Default ``(64, 64)`` matches
-            the SB3 MlpPolicy default so comparisons are fair.
-    """
-
-    def __init__(self, obs_dim: int, act_dim: int, hidden_sizes: tuple = (64, 64)):
+    def __init__(self, obs_dim, act_dim, hidden=(256, 256)):
         super().__init__()
-        layers = []
-        in_size = obs_dim
-        for h in hidden_sizes:
-            layers += [nn.Linear(in_size, h), nn.ReLU()]
-            in_size = h
-        layers.append(nn.Linear(in_size, act_dim))
+        layers, last = [], obs_dim
+        for h in hidden:
+            layers += [nn.Linear(last, h), nn.ReLU()]
+            last = h
+        layers += [nn.Linear(last, act_dim), nn.Tanh()]  # bound actions to [-1, 1]
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Standard PyTorch forward pass (batched tensors in, tensor out).
+    def forward(self, obs):
+        return self.net(obs)
 
-        Args:
-            x: ``(batch, obs_dim)`` float tensor.
-
-        Returns:
-            ``(batch, act_dim)`` float tensor of raw action values.
-        """
-        return self.net(x)
-
-    def predict(self, obs: np.ndarray) -> np.ndarray:
-        """Inference helper: accept a single NumPy observation, return action.
-
-        Adds and removes the batch dimension internally so callers don't have
-        to manage tensor shapes.
-
-        Args:
-            obs: ``(obs_dim,)`` float array.
-
-        Returns:
-            ``(act_dim,)`` float NumPy array.
-        """
-        with torch.no_grad():
-            x = torch.FloatTensor(obs).unsqueeze(0)
-            return self.net(x).squeeze(0).numpy()
-
-    def __call__(self, obs: np.ndarray) -> np.ndarray:
-        """Alias for ``predict`` so the policy works as a plain callable.
-
-        This lets ``MLPPolicy`` instances be passed anywhere an
-        ``obs -> action`` callable is expected (e.g. ``rollout_learner``).
-        """
-        return self.predict(obs)
+    @torch.no_grad()
+    def predict(self, obs, deterministic=True):
+        """Mirror the Expert.predict interface so eval/DAgger can call either
+        the expert or the learner through the same `.predict(obs)` signature.
+        Takes raw obs (np), returns action (np)."""
+        single = np.asarray(obs).ndim == 1
+        x = torch.as_tensor(np.atleast_2d(obs), dtype=torch.float32)
+        a = self.forward(x).cpu().numpy()
+        return a[0] if single else a

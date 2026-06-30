@@ -1,44 +1,72 @@
-"""Generate return curves: BC vs DAgger vs expert."""
+""" The two figures.
 
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+Fig 1 (bc_ablation.png): BC return vs number of demos — the distribution-shift
+collapse (low + unstable at few demos, expert-level by ~4).
 
-import pandas as pd
+Fig 2 (label_efficiency.png): return vs cumulative EXPERT LABELS, BC vs DAgger
+on one axis — the money plot. DAgger climbs from a starved 1-demo seed by
+spending labels on the student's own drifted states.
+"""
+import argparse, os, sys
 import numpy as np
-from utils import plot_return_curves
+import matplotlib.pyplot as plt
 
-BC_ABLATION_CSV = "results/bc_ablation.csv"
-DAGGER_CSV = "results/dagger_results.csv"
-EXPERT_RETURN = 250.0  # approximate; replace with actual value from 01_train_expert.py
-PLOT_PATH = "results/bc_vs_dagger.png"
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from src.data import load_demonstrations
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--bc", default="results/bc_ablation.npz")
+    p.add_argument("--dagger", default="results/dagger.npz")
+    p.add_argument("--demos", default="data/demos.npz")
+    p.add_argument("--outdir", default="results")
+    args = p.parse_args()
+
+    bc = np.load(args.bc)
+    dag = np.load(args.dagger)
+    bc_counts, bc_means, bc_stds = bc["counts"], bc["means"], bc["stds"]
+    dag_labels, dag_means, dag_stds = dag["labels"], dag["means"], dag["stds"]
+
+    trajs = load_demonstrations(args.demos)
+    lengths = np.array([len(t["obs"]) for t in trajs])
+    expert_return = float(np.mean([t["return"] for t in trajs]))
+    cum = np.cumsum(lengths)
+    bc_labels = np.array([cum[c - 1] for c in bc_counts])  # first-c demos
+
+    # ---- Figure 1: BC ablation ----
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.errorbar(bc_counts, bc_means, yerr=bc_stds, marker="o",
+                capsize=4, color="#c0392b", label="Behavior cloning")
+    ax.axhline(expert_return, ls="--", color="gray", label="Expert")
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(bc_counts)
+    ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+    ax.set_xlabel("Number of expert demonstrations")
+    ax.set_ylabel("Episode return")
+    ax.set_title("BC collapses and destabilizes when starved of demos")
+    ax.legend(); ax.grid(True, alpha=0.3)
+    f1 = os.path.join(args.outdir, "bc_ablation.png")
+    fig.tight_layout(); fig.savefig(f1, dpi=150); plt.close(fig)
+
+    # ---- Figure 2: label efficiency ----
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.errorbar(bc_labels, bc_means, yerr=bc_stds, marker="o",
+                capsize=4, color="#c0392b", label="Behavior cloning")
+    ax.errorbar(dag_labels, dag_means, yerr=dag_stds, marker="s",
+                capsize=4, color="#2980b9", label="DAgger (1-demo seed)")
+    ax.axhline(expert_return, ls="--", color="gray", label="Expert")
+    ax.set_xlabel("Cumulative expert labels (obs–action pairs)")
+    ax.set_ylabel("Episode return")
+    ax.set_title("Label efficiency: BC vs DAgger")
+    ax.legend(); ax.grid(True, alpha=0.3)
+    f2 = os.path.join(args.outdir, "label_efficiency.png")
+    fig.tight_layout(); fig.savefig(f2, dpi=150); plt.close(fig)
+
+    print(f"Saved {f1}")
+    print(f"Saved {f2}")
+    print(f"(expert reference = {expert_return:.0f})")
+
 
 if __name__ == "__main__":
-    results = {}
-
-    if os.path.exists(BC_ABLATION_CSV):
-        df = pd.read_csv(BC_ABLATION_CSV)
-        results["BC"] = (
-            df["n_demos"].tolist(),
-            df["mean_return"].tolist(),
-            df["std_return"].tolist(),
-        )
-
-    if os.path.exists(DAGGER_CSV):
-        df = pd.read_csv(DAGGER_CSV)
-        n = len(results.get("BC", ([],))[0]) or 5
-        xs = list(range(1, n + 1))
-        means = [df["mean_return"].iloc[0]] * n
-        stds = [df["std_return"].iloc[0]] * n
-        results["DAgger"] = (xs, means, stds)
-
-    n = len(results.get("BC", ([1, 2, 3, 4, 5],))[0])
-    results["Expert"] = (
-        list(range(1, n + 1)),
-        [EXPERT_RETURN] * n,
-        [0.0] * n,
-    )
-
-    os.makedirs("results", exist_ok=True)
-    plot_return_curves(results, save_path=PLOT_PATH)
-    print(f"Plot saved to {PLOT_PATH}")
+    main()

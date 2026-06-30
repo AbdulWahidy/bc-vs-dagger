@@ -1,9 +1,11 @@
-"""Step 05: DAgger from a starved 1-demo seed.
+"""DAgger from a starved 1-demo seed, averaged over
+several independent runs so the curve matches the BC ablation's methodology.
 
-BC at 1 demo was stuck at ~1015 ± 684 (collapsed AND unstable). Seed DAgger
-with that SAME 1 demo; let it collect expert corrections on the student's own
-drifted states. Watch return climb to expert level while we count cumulative
-expert labels — the basis for the label-efficiency comparison in step 06.
+Each run is a full, independent DAgger process with its own train + collect
+seeds (eval seed fixed for fairness). We average per iteration: label count and
+return across runs, with std = run-to-run spread of the method. Same idea as
+the 3-seed averaging step 04 used for BC, so the two curves are now apples-to-
+apples.
 """
 import argparse, os, sys
 import numpy as np
@@ -23,7 +25,7 @@ def main():
     p.add_argument("--iterations", type=int, default=8)
     p.add_argument("--rollout-episodes", type=int, default=1)
     p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--train-seed", type=int, default=0)
+    p.add_argument("--train-seeds", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--out", default="results/dagger.npz")
     args = p.parse_args()
 
@@ -36,23 +38,40 @@ def main():
     expert = Expert.load(model_path, stats_path)
 
     print(f"Seeding DAgger with {args.seed_demos} demo(s) "
-          f"({len(seed_dataset)} pairs). Running {args.iterations} iterations.\n")
-    policy, records = run_dagger(
-        seed_dataset, expert, obs_dim, act_dim,
-        env_id=args.env_id, n_iterations=args.iterations,
-        rollout_episodes=args.rollout_episodes, epochs=args.epochs,
-        train_seed=args.train_seed,
-    )
+          f"({len(seed_dataset)} pairs).")
+    print(f"Averaging over {len(args.train_seeds)} independent runs "
+          f"x {args.iterations} iterations.\n")
 
-    labels = np.array([r["n_labels"] for r in records])
-    means = np.array([r["return_mean"] for r in records])
-    stds = np.array([r["return_std"] for r in records])
+    all_labels, all_means = [], []   # each row = one run, over iterations
+    for run_i, s in enumerate(args.train_seeds):
+        print(f"--- run {run_i + 1}/{len(args.train_seeds)} (train_seed={s}) ---")
+        _, records = run_dagger(
+            seed_dataset, expert, obs_dim, act_dim,
+            env_id=args.env_id, n_iterations=args.iterations,
+            rollout_episodes=args.rollout_episodes, epochs=args.epochs,
+            train_seed=s, collect_seed=5000 + run_i * 10000,
+            eval_seed=3000, verbose=True,
+        )
+        all_labels.append([r["n_labels"] for r in records])
+        all_means.append([r["return_mean"] for r in records])
+        print()
+
+    all_labels = np.array(all_labels)   # (runs, iters)
+    all_means = np.array(all_means)     # (runs, iters)
+    labels = all_labels.mean(axis=0)    # mean label count per iteration
+    means = all_means.mean(axis=0)      # mean return per iteration
+    stds = all_means.std(axis=0)        # run-to-run spread of the method
+
     np.savez(args.out, labels=labels, means=means, stds=stds)
-    print(f"\nSaved DAgger curve -> {args.out}")
-    print(f"Start: {means[0]:.1f} ± {stds[0]:.1f} at {labels[0]} labels")
-    print(f"End:   {means[-1]:.1f} ± {stds[-1]:.1f} at {labels[-1]} labels")
-    print("Step 06 plots this against the BC ablation.")
+
+    print("Averaged DAgger curve:")
+    for i in range(len(labels)):
+        print(f"  iter {i:2d}  labels~{labels[i]:6.0f}  "
+              f"return={means[i]:7.1f} ± {stds[i]:5.1f}")
+    print(f"\nSaved -> {args.out}")
+    print(f"Start: {means[0]:.1f} at ~{labels[0]:.0f} labels")
+    print(f"End:   {means[-1]:.1f} at ~{labels[-1]:.0f} labels")
 
 
 if __name__ == "__main__":
-    main()
+    main() 
